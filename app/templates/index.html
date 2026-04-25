@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <title>{{ node_name }} | 分散式帳本</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        body { background-color: #f8f9fa; }
+        .card { box-shadow: 0 4px 6px rgba(0,0,0,0.1); margin-bottom: 20px; }
+        .terminal { background-color: #212529; color: #00ff00; padding: 15px; border-radius: 5px; height: 200px; overflow-y: auto; font-family: monospace; }
+        .table-container { max-height: 250px; overflow-y: auto; margin-top: 10px; }
+        .table-container thead th { position: sticky; top: 0; z-index: 1; }
+    </style>
+</head>
+<body>
+<div class="container mt-5">
+    <h2 class="mb-4 text-primary fw-bold">
+        📦 {{ node_name }}
+        <span class="badge bg-secondary align-middle" style="font-size: 0.45em; opacity: 0.8;">IP: {{ ip }}</span>
+    </h2>
+    
+    <div class="row">
+        <div class="col-md-6">
+            <div class="card">
+                <div class="card-header bg-dark text-white">🔍 帳戶查詢</div>
+                <div class="card-body">
+                    <div class="input-group mb-3">
+                        <input type="text" id="queryAccount" class="form-control" placeholder="輸入帳戶名稱 (例如: Alice)">
+                        <button class="btn btn-outline-primary" onclick="checkMoney()">查餘額</button>
+                        <button class="btn btn-outline-secondary" onclick="checkLog()">查明細</button>
+                    </div>
+                    <div id="queryResult" class="alert alert-info" style="display:none; padding: 10px;"></div>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-header bg-success text-white">💸 發起交易</div>
+                <div class="card-body">
+                    <div class="row mb-2">
+                        <div class="col"><input type="text" id="sender" class="form-control" placeholder="付款人 (From)"></div>
+                        <div class="col"><input type="text" id="receiver" class="form-control" placeholder="收款人 (To)"></div>
+                    </div>
+                    <div class="input-group">
+                        <input type="number" id="amount" class="form-control" placeholder="金額">
+                        <button class="btn btn-success" onclick="sendTransaction()">送出廣播</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="col-md-6">
+            <div class="card">
+                <div class="card-header bg-danger text-white">🛡️ 系統與共識機制</div>
+                <div class="card-body">
+                    <button class="btn btn-warning mb-2 w-100" onclick="checkChain()">檢查本地帳本 (checkChain)</button>
+                    <div class="input-group">
+                        <input type="text" id="rewardAccount" class="form-control" placeholder="驗證獎勵帳戶 (例如: Alice)">
+                        <button class="btn btn-danger" onclick="checkAllChains()">發起全網共識驗證 (checkAllChains)</button>
+                    </div>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-header bg-secondary text-white">🖥️ 系統日誌</div>
+                <div class="card-body p-0">
+                    <div class="terminal" id="systemLog">
+                        系統啟動，等待操作中...<br>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+    function logMessage(msg) {
+        const logger = document.getElementById('systemLog');
+        let formattedMsg = String(msg).replace(/\\n/g, '<br>').replace(/\\\\n/g, '<br>');
+        logger.innerHTML += `[${new Date().toLocaleTimeString()}] ${formattedMsg}<br>`;
+        logger.scrollTop = logger.scrollHeight;
+    }
+
+    // --- 自動輪詢機制 ---
+    setInterval(async () => {
+        try {
+            let res = await fetch('/api/poll_logs');
+            let data = await res.json();
+            if (data.logs && data.logs.length > 0) {
+                data.logs.forEach(msg => logMessage(msg));
+            }
+        } catch (e) {}
+    }, 1500);
+
+    async function checkMoney() {
+        const acc = document.getElementById('queryAccount').value;
+        if(!acc) return alert('請輸入帳戶');
+        let res = await fetch(`/api/money/${acc}`);
+        let data = await res.json();
+        document.getElementById('queryResult').style.display = 'block';
+        document.getElementById('queryResult').innerHTML = `<strong>${acc}</strong> 的餘額為: <strong>${data.balance}</strong> 元`;
+        logMessage(`查詢 ${acc} 餘額完成。`);
+    }
+
+    async function checkLog() {
+        const acc = document.getElementById('queryAccount').value.trim();
+        if(!acc) return alert('請輸入帳戶');
+        
+        let res = await fetch(`/api/log/${acc}`);
+        let data = await res.json();
+        const resultDiv = document.getElementById('queryResult');
+        resultDiv.style.display = 'block';
+        
+        if (data.logs.length === 0) {
+            resultDiv.innerHTML = `<strong>${acc} 的交易明細:</strong><br>無交易紀錄`;
+        } else {
+            let tableHtml = `
+            <strong>${acc} 的交易明細:</strong>
+            <div class="table-container">
+                <table class="table table-sm table-bordered table-hover text-center mb-0">
+                    <thead class="table-dark">
+                        <tr>
+                            <th>發送方 (From)</th>
+                            <th>接收方 (To)</th>
+                            <th>金額</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+            `;
+            
+            data.logs.forEach(log => {
+                let parts = log.split(',');
+                if(parts.length >= 3) {
+                    let sender = parts[0].trim();
+                    let receiver = parts[1].trim();
+                    let amount = parts[2].trim();
+                    
+                    let rowClass = "";
+                    if (sender === acc) {
+                        rowClass = "table-danger"; 
+                    } else if (receiver === acc) {
+                        rowClass = "table-success";
+                    }
+
+                    tableHtml += `<tr class="${rowClass}">
+                        <td>${sender}</td>
+                        <td>${receiver}</td>
+                        <td>${amount}</td>
+                    </tr>`;
+                }
+            });
+            
+            tableHtml += `</tbody></table></div>`;
+            resultDiv.innerHTML = tableHtml;
+        }
+        logMessage(`查詢 ${acc} 紀錄完成 (共 ${data.logs.length} 筆)。`);
+    }
+
+    async function sendTransaction() {
+        // 1. 抓取網頁輸入資料
+        const data = {
+            sender: document.getElementById('sender').value,
+            receiver: document.getElementById('receiver').value,
+            amount: document.getElementById('amount').value
+        };
+
+        // 如果輸入欄位是空的，先擋下來
+        if (!data.sender || !data.receiver || !data.amount) {
+            addLog("⚠️ 請填寫完整的交易資訊", "#ffc107");
+            return;
+        }
+
+        try {
+            // 2. 發起請求並「等待」回應
+            const response = await fetch('/api/transaction', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(data)
+            });
+
+            // 3. 解析 JSON 內容
+            const result = await response.json();
+
+            // 4. 根據 HTTP 狀態碼或自定義 status 判斷結果
+            if (response.ok && result.status === "success") {
+                // ✅ 交易成功 (200 OK)
+                addLog(`✅ ${result.message}: ${data.sender} -> ${data.receiver} ($${data.amount})`, "#28a745");
+                // 如果「付款人」正好是目前查詢的帳戶，就自動刷新餘額；否則什麼都不做
+                const queryAcc = document.getElementById('queryAccount').value.trim();
+                if (queryAcc && (queryAcc === data.sender || queryAcc === data.receiver)) {
+                    checkMoney();
+                }
+            } else {
+                // ❌ 邏輯錯誤 (例如 400 餘額不足)
+                addLog(`❌ 交易失敗: ${result.message}`, "#dc3545");
+            }
+
+        } catch (error) {
+            // 🛠️ 系統崩潰或網路斷線
+            console.error("發生錯誤:", error);
+            // 把真實錯誤訊息印出來，別再騙自己是「無法連線」
+            addLog(`🚨 系統異常: ${error.name} - ${error.message}`, "#ffc107");
+        }
+    }
+
+    function addLog(msg, color = "white") {
+        const logBox = document.getElementById('systemLog');
+        if (!logBox) {
+            console.warn("找不到 log-box 元素，訊息:", msg);
+            return;
+        }
+        const now = new Date().toLocaleTimeString();
+        logBox.innerHTML += `<div style="color: ${color}; margin-bottom: 5px;">[${now}] ${msg}</div>`;
+        logBox.scrollTop = logBox.scrollHeight;
+    }
+
+    async function checkChain() {
+        let res = await fetch('/api/checkChain');
+        let data = await res.json();
+        logMessage(`本地檢查: ${data.message}`);
+    }
+
+    async function checkAllChains() {
+        const target = document.getElementById('rewardAccount').value;
+        if(!target) return alert('請輸入要接收獎勵的帳戶');
+        logMessage('🚀 發起全網共識比對中，請稍候...');
+        
+        let res = await fetch(`/api/checkAllChains/${target}`);
+        let data = await res.json();
+        logMessage(`共識結果:<br>${data.message}`);
+    }
+</script>
+</body>
+</html>

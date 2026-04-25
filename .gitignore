@@ -1,0 +1,12 @@
+# 忽略帳本資料夾 (最重要的)
+storage/
+
+# 忽略 Python 快取
+__pycache__/
+*.py[cod]
+
+# 忽略環境變數設定檔
+.env
+
+# 忽略系統暫存檔
+.DS_Store

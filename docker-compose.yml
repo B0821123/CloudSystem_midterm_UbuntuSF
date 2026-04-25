@@ -1,0 +1,60 @@
+version: '3.8'
+
+x-client-base: &client-base
+  build: .
+  tty: true
+  stdin_open: true  # 保持標準輸入開啟
+  command: python3 /app/p2p_main.py
+
+services:
+  client1:
+    <<: *client-base
+    container_name: client1
+    environment:
+      - MY_P2P_PORT=8001
+    volumes:
+      - ./storage/client1:/storage
+      - ./app:/app
+    ports:
+      - "8081:5000"
+      - "8001:8001/udp"
+    networks:
+      p2p_net:
+        ipv4_address: 172.18.0.2
+
+  client2:
+    <<: *client-base
+    container_name: client2
+    environment:
+      - MY_P2P_PORT=8002
+    volumes:
+      - ./storage/client2:/storage
+      - ./app:/app
+    ports:
+      - "8082:5000"
+      - "8002:8002/udp"
+    networks:
+      p2p_net:
+        ipv4_address: 172.18.0.3
+
+  client3:
+    <<: *client-base
+    container_name: client3
+    environment:
+      - MY_P2P_PORT=8003
+    volumes:
+      - ./storage/client3:/storage
+      - ./app:/app
+    ports:
+      - "8083:5000"
+      - "8003:8003/udp"
+    networks:
+      p2p_net:
+        ipv4_address: 172.18.0.4
+
+networks:
+  p2p_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.18.0.0/16
