@@ -134,6 +134,21 @@ class P2PNode:
             except Exception as e:
                 print(f"[Error] 監聽發生錯誤: {e}")
 
+    def _get_total_tx_count(self):
+        with self.file_lock:
+            files = self._ledger_files_unlocked()
+            if not files: return 0
+            
+            # 公式實作：(總檔案數 - 1) * 5
+            total_from_full_blocks = (len(files) - 1) * 5
+            
+            # 讀取最後一個檔案看裡面有幾筆交易 (算有逗號的行數)
+            with open(os.path.join(STORAGE_PATH, files[-1]), "r") as f:
+                last_block_content = f.readlines()
+                tx_in_last_block = sum(1 for line in last_block_content if "," in line)
+                
+            return total_from_full_blocks + tx_in_last_block
+
 # ==========================================
 # 帳本與共識邏輯 
 # ==========================================

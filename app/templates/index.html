@@ -3,70 +3,177 @@
 <html lang="zh-TW">
 <head>
     <meta charset="UTF-8">
-    <title>{{ node_name }} | 分散式帳本</title>
+    <title>{{ node_name }} | 分散式帳本控制台</title>
+    <!-- 引入專業字體與圖示 -->
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;700&family=JetBrains+Mono&display=swap" rel="stylesheet">
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    
     <style>
-        body { background-color: #f8f9fa; }
-        .card { box-shadow: 0 4px 6px rgba(0,0,0,0.1); margin-bottom: 20px; }
-        .terminal { background-color: #212529; color: #00ff00; padding: 15px; border-radius: 5px; height: 200px; overflow-y: auto; font-family: monospace; }
-        .table-container { max-height: 250px; overflow-y: auto; margin-top: 10px; }
-        .table-container thead th { position: sticky; top: 0; z-index: 1; }
+        :root {
+            --bg-body: #0f172a;        /* 深藍底 */
+            --bg-card: #1e293b;        /* 卡片深灰藍 */
+            --bg-result: #000000;      /* 查詢結果純黑底 */
+            --text-bright: #ffffff;    /* 純白文字 */
+            --accent-cyan: #22d3ee;    /* 青色 (查詢/連結) */
+            --accent-green: #10b981;   /* 綠色 (交易) */
+            --accent-red: #f43f5e;     /* 紅色 (共識) */
+            --border-glow: #334155;
+        }
+
+        body { 
+            background-color: var(--bg-body); 
+            color: var(--text-bright);
+            font-family: 'Inter', sans-serif;
+        }
+
+        /* 頂部標題與統計區 */
+        .header-section {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-bottom: 1px solid var(--border-glow);
+            padding-bottom: 20px;
+            margin-bottom: 30px;
+        }
+
+        .stats-badge {
+            background: linear-gradient(135deg, #3b82f6 0%, #8b5cf6 100%);
+            padding: 12px 25px;
+            border-radius: 12px;
+            text-align: center;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.5);
+            border: 1px solid rgba(255,255,255,0.2);
+        }
+
+        .stats-count { font-size: 2rem; font-weight: 800; display: block; font-family: 'JetBrains Mono'; }
+
+        /* 卡片美化 */
+        .card { 
+            background-color: var(--bg-card); 
+            border: 1px solid var(--border-glow);
+            border-radius: 15px;
+            margin-bottom: 25px;
+            overflow: hidden;
+            box-shadow: 0 10px 20px rgba(0,0,0,0.2);
+        }
+
+        .card-header {
+            font-weight: 700;
+            letter-spacing: 1px;
+            border-bottom: 1px solid var(--border-glow) !important;
+            padding: 12px 20px;
+        }
+
+        /* 查詢結果區：解決「灰色髒感」，改為霓虹黑框 */
+        #queryResult {
+            display: none;
+            background-color: var(--bg-result) !important;
+            border: 2px solid var(--accent-cyan) !important;
+            box-shadow: 0 0 15px rgba(34, 211, 238, 0.3);
+            color: #ffffff !important;
+            padding: 20px;
+            border-radius: 12px;
+            margin-top: 15px;
+        }
+
+        /* 輸入框強化亮度 */
+        .form-control {
+            background-color: #0f172a !important;
+            border: 1px solid #475569 !important;
+            color: #ffffff !important;
+            font-size: 1rem;
+        }
+        .form-control::placeholder { color: #94a3b8; }
+        .form-control:focus { border-color: var(--accent-cyan); box-shadow: 0 0 0 3px rgba(34, 211, 238, 0.2); }
+
+        /* 終端機樣式 */
+        .terminal { 
+            background-color: #000000; 
+            color: #4ade80; 
+            padding: 15px; 
+            border-radius: 10px; 
+            height: 280px; 
+            overflow-y: auto; 
+            font-family: 'JetBrains Mono', monospace;
+            border: 1px solid #334155;
+            font-size: 0.85rem;
+            line-height: 1.6;
+        }
+
+        /* 表格與明細顏色 */
+        .row-income { color: var(--accent-green) !important; font-weight: bold; background: rgba(16, 185, 129, 0.1); }
+        .row-expense { color: var(--accent-red) !important; background: rgba(244, 63, 94, 0.1); }
+        
+        .btn-bold { font-weight: 700; text-transform: uppercase; padding: 8px 20px; }
     </style>
 </head>
 <body>
+
 <div class="container mt-5">
-    <h2 class="mb-4 text-primary fw-bold">
-        📦 {{ node_name }}
-        <span class="badge bg-secondary align-middle" style="font-size: 0.45em; opacity: 0.8;">IP: {{ ip }}</span>
-    </h2>
+    <div class="header-section">
+        <div>
+            <h2 class="fw-bold text-info mb-0"><i class="fa-solid fa-cube me-2"></i>{{ node_name }}</h2>
+            <div class="mt-1 opacity-75 small"><i class="fa-solid fa-network-wired me-1"></i> 節點地址: {{ ip }}</div>
+        </div>
+        
+        <div class="stats-badge">
+            <span class="small opacity-75 fw-bold">目前帳本總交易數</span>
+            <span class="stats-count" id="totalTxDisplay">0</span>
+        </div>
+    </div>
     
     <div class="row">
         <div class="col-md-6">
-            <div class="card">
-                <div class="card-header bg-dark text-white">🔍 帳戶查詢</div>
+            <div class="card shadow">
+                <div class="card-header bg-dark text-white"><i class="fa-solid fa-magnifying-glass me-2"></i>帳戶資產與明細</div>
                 <div class="card-body">
                     <div class="input-group mb-3">
-                        <input type="text" id="queryAccount" class="form-control" placeholder="輸入帳戶名稱 (例如: Alice)">
-                        <button class="btn btn-outline-primary" onclick="checkMoney()">查餘額</button>
-                        <button class="btn btn-outline-secondary" onclick="checkLog()">查明細</button>
+                        <input type="text" id="queryAccount" class="form-control" placeholder="輸入帳戶名稱">
+                        <button class="btn btn-outline-info btn-bold" onclick="checkMoney()">查餘額</button>
+                        <button class="btn btn-info btn-bold text-dark" onclick="checkLog()">查明細</button>
                     </div>
-                    <div id="queryResult" class="alert alert-info" style="display:none; padding: 10px;"></div>
+                    <div id="queryResult"></div>
                 </div>
             </div>
 
-            <div class="card">
-                <div class="card-header bg-success text-white">💸 發起交易</div>
+            <div class="card shadow">
+                <div class="card-header bg-success text-white"><i class="fa-solid fa-paper-plane me-2"></i>發起交易廣播</div>
                 <div class="card-body">
-                    <div class="row mb-2">
-                        <div class="col"><input type="text" id="sender" class="form-control" placeholder="付款人 (From)"></div>
-                        <div class="col"><input type="text" id="receiver" class="form-control" placeholder="收款人 (To)"></div>
+                    <div class="row mb-3">
+                        <div class="col">
+                            <label class="small opacity-75 mb-1">付款人 (From)</label>
+                            <input type="text" id="sender" class="form-control" placeholder="Sender ID">
+                        </div>
+                        <div class="col">
+                            <label class="small opacity-75 mb-1">收款人 (To)</label>
+                            <input type="text" id="receiver" class="form-control" placeholder="Receiver ID">
+                        </div>
                     </div>
                     <div class="input-group">
-                        <input type="number" id="amount" class="form-control" placeholder="金額">
-                        <button class="btn btn-success" onclick="sendTransaction()">送出廣播</button>
+                        <input type="number" id="amount" class="form-control" placeholder="輸入金額">
+                        <button class="btn btn-success btn-bold px-4" onclick="sendTransaction()">送出交易</button>
                     </div>
                 </div>
             </div>
         </div>
 
         <div class="col-md-6">
-            <div class="card">
-                <div class="card-header bg-danger text-white">🛡️ 系統與共識機制</div>
+            <div class="card shadow border-warning">
+                <div class="card-header bg-danger text-white"><i class="fa-solid fa-shield-halved me-2"></i>共識防禦機制</div>
                 <div class="card-body">
-                    <button class="btn btn-warning mb-2 w-100" onclick="checkChain()">檢查本地帳本 (checkChain)</button>
+                    <button class="btn btn-warning mb-3 w-100 fw-bold" onclick="checkChain()">本地帳本鏈完整性檢查</button>
                     <div class="input-group">
-                        <input type="text" id="rewardAccount" class="form-control" placeholder="驗證獎勵帳戶 (例如: Alice)">
-                        <button class="btn btn-danger" onclick="checkAllChains()">發起全網共識驗證 (checkAllChains)</button>
+                        <input type="text" id="rewardAccount" class="form-control" placeholder="獎勵接收帳戶">
+                        <button class="btn btn-danger btn-bold" onclick="checkAllChains()">發起全網共識驗證</button>
                     </div>
                 </div>
             </div>
 
-            <div class="card">
-                <div class="card-header bg-secondary text-white">🖥️ 系統日誌</div>
+            <div class="card shadow">
+                <div class="card-header bg-secondary text-white small py-1"><i class="fa-solid fa-terminal me-2"></i>系統日誌</div>
                 <div class="card-body p-0">
-                    <div class="terminal" id="systemLog">
-                        系統啟動，等待操作中...<br>
-                    </div>
+                    <div class="terminal" id="systemLog">系統就緒...<br></div>
                 </div>
             </div>
         </div>
@@ -84,11 +191,16 @@
     // --- 自動輪詢機制 ---
     setInterval(async () => {
         try {
+            // 1. 原本的 Log 輪詢 (保留)
             let res = await fetch('/api/poll_logs');
             let data = await res.json();
-            if (data.logs && data.logs.length > 0) {
-                data.logs.forEach(msg => logMessage(msg));
-            }
+            if (data.logs) { data.logs.forEach(msg => logMessage(msg)); }
+
+            // 2. 【新增】調用你的公式 API
+            let statsRes = await fetch('/api/stats');
+            let statsData = await statsRes.json();
+            document.getElementById('totalTxDisplay').innerText = statsData.total_tx;
+
         } catch (e) {}
     }, 1500);
 
