@@ -72,3 +72,7 @@ def api_poll_logs():
         logs = node_instance.log_buffer.copy()
         node_instance.log_buffer.clear()
     return jsonify({"logs": logs})
+
+@main_bp.route('/api/stats')
+def get_stats():
+    return jsonify({"total_tx": node_instance._get_total_tx_count()})
