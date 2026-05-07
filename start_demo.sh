@@ -1,44 +1,30 @@
 #!/bin/bash
+# Demo bootstrap：清掉舊帳本 -> 起 docker -> 灌 100 筆測試交易
 set -e
 
-echo "========================================"
-echo "🧹 [1/4] 清理舊帳本資料 ..."
-echo "========================================"
-rm -f ./storage/client1/*.txt
-rm -f ./storage/client2/*.txt
-rm -f ./storage/client3/*.txt
+HOST_IP="${HOST_IP:-localhost}"
 
-echo ""
-echo "========================================"
-echo "🐳 [2/4] 啟動 Docker 容器並自動執行 P2P 節點 ..."
-echo "========================================"
+# 清除上一輪殘留的帳本
+rm -f ./storage/client{1,2,3}/*.txt
+
+# 重啟三個 P2P 節點
 docker-compose down
 docker-compose up -d --build
 
-echo ""
-echo "========================================"
-echo "⏳ [3/4] 等待節點就緒 ..."
-echo "========================================"
-# auto_tx.py 自己會做 30 秒健康檢查重試，這裡只需簡短等候容器啟動
+# 容器要幾秒才會把 Flask 拉起來，auto_tx.py 內部還會自己 retry
 sleep 3
 
-echo ""
-echo "========================================"
-echo "🚀 [4/4] 自動產生 100 筆測試交易 ..."
-echo "========================================"
 python3 auto_tx.py
 
-echo ""
-echo "========================================"
-echo "✅ 環境建置完畢"
-echo "========================================"
-echo "在實體電腦瀏覽器開啟（替換成你的 VM IP）："
-echo "  🔗 Client 1: http://192.168.244.128:8081"
-echo "  🔗 Client 2: http://192.168.244.128:8082"
-echo "  🔗 Client 3: http://192.168.244.128:8083"
-echo ""
-echo "常用操作："
-echo "  👉 即時監看三節點日誌 : docker-compose logs -f"
-echo "  👉 進入 Client 2 竄改  : docker exec -it client2 bash"
-echo "  👉 停止整個環境        : docker-compose down"
-echo "========================================"
+cat <<EOF
+
+Done. 從你的實體機瀏覽器連入：
+  Client 1  http://${HOST_IP}:8081
+  Client 2  http://${HOST_IP}:8082
+  Client 3  http://${HOST_IP}:8083
+
+常用指令：
+  docker-compose logs -f          # 追蹤三個節點 log
+  docker exec -it client2 bash    # 進 client2 做竄改測試
+  docker-compose down             # 收掉整個環境
+EOF
