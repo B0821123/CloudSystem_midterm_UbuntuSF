@@ -546,22 +546,38 @@ class P2PNode:
         if total_expected < MIN_QUORUM_NODES:
             return False, f"存活節點不足（{total_expected}/{MIN_QUORUM_NODES}），無法達成共識修復。"
 
-        majority_hash, max_count = self._majority_hash(all_votes)
-        if not majority_hash:
-            return False, "No valid peer ledger hash is available for repair."
+        plurality_hash, max_count = self._majority_hash(all_votes)
+        if not plurality_hash:
+            return False, "全網均無有效帳本可作為修復來源。"
 
-        if max_count <= total_expected / 2:
-            return False, f"No majority ledger hash yet ({max_count}/{total_expected})."
+        is_majority = max_count > total_expected / 2
+        am_broken = my_hash in ("INVALID", "EMPTY")
 
-        if my_hash == majority_hash:
-            return True, "Local ledger already matches the majority."
+        # =============================================================
+        # 救援邏輯：解決「6 個節點中 3 個被竄改 → max_count=3 不過半 → 死鎖」
+        #
+        # 過去這裡無條件要求過半多數，造成 3/6 壞掉時連自己也救不了自己——
+        # 全網驗證 DISTRUST 後系統永遠凍結。
+        #
+        # 但「我自己已經 INVALID/EMPTY」這件事本身就是強訊號：
+        # 本機 4 層完整性檢查已經證明我目前的資料是錯的。在這個前提下，
+        # 任何 valid peer 的資料都嚴格優於我目前的，所以即使沒過半也應該拉。
+        # 這個放寬只覆蓋「明顯壞掉」的情況，不會放寬「兩派 valid 誰是真的」的判斷。
+        # =============================================================
+        if not is_majority and not am_broken:
+            # 我自己看起來正常 + 網路沒過半 → 不敢擅自改自己，可能誤判
+            return False, f"未達過半 ({max_count}/{total_expected})，且本機帳本目前 valid，不自動覆寫。"
 
-        provider_id = [node_id for node_id, h in all_votes.items() if h == majority_hash][0]
+        if my_hash == plurality_hash:
+            return True, "本地帳本已與最大有效群組一致。"
+
+        provider_id = [node_id for node_id, h in all_votes.items() if h == plurality_hash][0]
         if provider_id not in self.nodes_contact_book:
-            return False, f"Repair provider {provider_id} is not in the contact book."
+            return False, f"找不到 provider {provider_id} 的位址。"
 
         self.sock.sendto(b"REQ_SYNC", self.nodes_contact_book[provider_id])
-        return True, f"向 {provider_id} 發起維修請求"
+        mode = "多數派" if is_majority else "救援（本機已壞，套用最大有效群組）"
+        return True, f"向 {provider_id} 發起維修請求 ({mode})"
 
     def _repair_from_majority(self):
         my_hash, all_votes, total_expected = self._collect_last_hash_votes()
@@ -813,11 +829,78 @@ class P2PNode:
                 # 走到這裡保證 tampered 非空（我自己就在 tampered 裡），provider_id 一定有定義
                 output_msg += f"\n本機已向 {provider_id} 修復\n本輪不發放獎勵"
         else:
+            # =================================================================
+            # 未達過半 —— 救援邏輯
+            #
+            # 過去這裡無條件 DISTRUST，造成「6 個節點裡 3 個被竄改」就永遠凍結
+            # （第一次驗證 DISTRUST，再驗一次還是 DISTRUST，被竄改的節點本機檢查
+            #  也救不了自己，因為救援也要求過半）。
+            #
+            # 新邏輯：先看能不能局部救援，再決定要不要 DISTRUST：
+            #   - 若我在 plurality 且有明顯壞掉 (INVALID/EMPTY) 的 peer
+            #     → 直接 TCP 推送給他們（用我手上的 valid 資料）
+            #   - 若我自己壞了 + 網路有 plurality（雖然沒過半）
+            #     → 向 plurality 的 provider 發 REQ_SYNC，讓自己被救
+            #   - 兩種情況都成立時兩種一起做
+            # 任一救援成功，下一次驗證就能形成過半 → 自動解凍。
+            # 只有「純分裂、沒有 INVALID 節點可救」才真的 DISTRUST。
+            # =================================================================
             output_msg += f"\n未達過半 ({max_count}/{total_expected})"
-            self.network_trusted = False
-            reason = f"無法達成過半數共識 ({max_count}/{total_expected})"
-            self.network_trusted_reason = reason
-            self._broadcast_distrust(reason, live_peers)
+
+            broken_peer_ids = [
+                nid for nid, h in all_votes.items()
+                if h in ("INVALID", "EMPTY") and nid != self.node_id
+            ]
+            am_broken = my_hash in ("INVALID", "EMPTY")
+            i_have_valid_data = (my_hash == majority_hash) and not am_broken
+
+            rescue_attempted = False
+
+            # 救援 1：我有正確資料 + 有明顯壞掉的 peer → 直接 TCP 推送
+            if i_have_valid_data and broken_peer_ids:
+                push_count = 0
+                for nid in broken_peer_ids:
+                    if nid in self.nodes_contact_book:
+                        target_addr = self.nodes_contact_book[nid]
+                        self.add_log(f"[共識/救援] 推送帳本給壞掉的 {nid}")
+                        threading.Thread(
+                            target=self._send_ledger_via_tcp,
+                            args=(target_addr,),
+                            daemon=True,
+                        ).start()
+                        push_count += 1
+                if push_count > 0:
+                    output_msg += f"\n本機在最大有效群組\n已救援 {push_count} 個壞節點"
+                    rescue_attempted = True
+
+            # 救援 2：我自己壞了 → 拉 plurality 的資料救自己
+            if am_broken:
+                provider_id_for_self = next(
+                    (nid for nid, h in all_votes.items() if h == majority_hash),
+                    None,
+                )
+                if provider_id_for_self and provider_id_for_self in self.nodes_contact_book:
+                    self.sock.sendto(
+                        b"REQ_SYNC",
+                        self.nodes_contact_book[provider_id_for_self],
+                    )
+                    self.add_log(f"[共識/救援] 本機已壞\n向 {provider_id_for_self} 拉取救援資料")
+                    output_msg += f"\n本機已壞，正在向 {provider_id_for_self} 救援"
+                    rescue_attempted = True
+
+            if rescue_attempted:
+                # 留一段時間等 TCP 推送 / REQ_SYNC-RESP_SYNC 完成
+                time.sleep(SYNC_WAIT_SECONDS)
+                output_msg += "\n救援已派出，請再次發起全網驗證以解凍"
+                # 注意：這裡不發 TRUST（網路還沒過半，不能保證一致），
+                #       也不發 DISTRUST（救援還在發酵，下輪可能就過半）。
+                #       network_trusted 維持原狀。
+            else:
+                # 真的沒救：純分裂（沒有 INVALID 節點可救）或全網皆無 valid hash
+                self.network_trusted = False
+                reason = f"無法達成過半數共識 ({max_count}/{total_expected})"
+                self.network_trusted_reason = reason
+                self._broadcast_distrust(reason, live_peers)
 
         if gui_mode: return output_msg
 
