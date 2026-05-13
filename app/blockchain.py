@@ -14,6 +14,7 @@ from collections import Counter
 STORAGE_PATH = "/storage"
 HEAD_HASH_FILE = os.path.join(STORAGE_PATH, "latest_hash.txt")
 SYNC_WAIT_SECONDS = 2
+TX_REPAIR_FANOUT_DELAY_SECONDS = 0.75
 
 # 心跳設定：每 HEARTBEAT_INTERVAL 秒對所有 peer 發 PING；
 # 若超過 HEARTBEAT_TIMEOUT 秒沒收到回覆，視為離線。
@@ -57,6 +58,11 @@ class P2PNode:
 
         self.log_buffer = []
         self.log_lock = threading.Lock()
+        self.tx_id_lock = threading.Lock()
+        self.tx_id_results = {}
+        self.tx_id_inflight = {}
+        self.repair_fanout_lock = threading.Lock()
+        self.repair_fanout_timer = None
 
         # node_id 優先順序：呼叫端顯式指定 > NODE_NAME env > ip-port
         self.node_id = my_node_id or os.environ.get("NODE_NAME") or f"{ip}-{port}"
@@ -182,6 +188,49 @@ class P2PNode:
         except Exception as e:
             self.add_log(f"[同步/TCP] 推送至 {target_addr} 失敗: {e}")
 
+    def _request_sync_from_node(self, provider_id, reason):
+        if provider_id in self.nodes_contact_book:
+            self.sock.sendto(b"REQ_SYNC", self.nodes_contact_book[provider_id])
+            self.add_log(f"[同步] {reason}\n向 {provider_id} 請求帳本快照")
+            return True
+
+        self.add_log(f"[同步] {reason}\n找不到 {provider_id}，改由共識修復")
+        threading.Thread(target=self._repair_from_majority, daemon=True).start()
+        return False
+
+    def _push_ledger_to_live_peers(self, reason="交易補救"):
+        live_peers = self._live_peer_addresses()
+        if not live_peers:
+            self.add_log(f"[同步/TCP] {reason}: 目前沒有可推送的線上節點")
+            return
+
+        self.add_log(f"[同步/TCP] {reason}: 推送帳本快照給 {len(live_peers)} 個線上節點")
+        for peer in live_peers:
+            threading.Thread(
+                target=self._send_ledger_via_tcp,
+                args=(peer,),
+                daemon=True,
+            ).start()
+
+    def _schedule_ledger_repair_fanout(self, reason="交易補救"):
+        lock = getattr(self, "repair_fanout_lock", None)
+        if lock is None:
+            self._push_ledger_to_live_peers(reason)
+            return
+
+        with lock:
+            timer = getattr(self, "repair_fanout_timer", None)
+            if timer:
+                timer.cancel()
+            timer = threading.Timer(
+                TX_REPAIR_FANOUT_DELAY_SECONDS,
+                self._push_ledger_to_live_peers,
+                args=(reason,),
+            )
+            timer.daemon = True
+            self.repair_fanout_timer = timer
+            timer.start()
+
     # ============================================================
     # 修改 3：啟動後 bootstrap —— 若本地空帳本但有存活鄰居，主動同步一次
     # ============================================================
@@ -249,6 +298,13 @@ class P2PNode:
                 pid for pid, ts in self.peer_last_seen.items()
                 if now - ts <= HEARTBEAT_TIMEOUT
             }
+
+    def _live_peer_addresses(self):
+        return [
+            self.nodes_contact_book[pid]
+            for pid in self.get_live_peer_ids()
+            if pid in self.nodes_contact_book
+        ]
 
     def get_peer_status(self):
         """提供前端：每個已知 peer 的線上狀態。"""
@@ -329,6 +385,9 @@ class P2PNode:
                             threading.Thread(
                                 target=self._repair_from_majority, daemon=True
                             ).start()
+
+                elif message.startswith("TX2:"):
+                    self._handle_reliable_tx(message.split(":"))
 
                 elif message.startswith("REQ_HASH"):
                     # 收到 REQ_HASH 代表「網路上有人正在跑共識」——
@@ -518,11 +577,7 @@ class P2PNode:
         self.awaiting_hashes = True
 
         # 只向「目前存活」的 peer 索取 hash；通訊錄中的離線節點直接略過。
-        live_ids = self.get_live_peer_ids()
-        live_peers = [
-            self.nodes_contact_book[pid] for pid in live_ids
-            if pid in self.nodes_contact_book
-        ]
+        live_peers = self._live_peer_addresses()
         for peer in live_peers:
             self.sock.sendto(b"REQ_HASH", peer)
 
@@ -578,6 +633,116 @@ class P2PNode:
         self.sock.sendto(b"REQ_SYNC", self.nodes_contact_book[provider_id])
         mode = "多數派" if is_majority else "救援（本機已壞，套用最大有效群組）"
         return True, f"向 {provider_id} 發起維修請求 ({mode})"
+
+    def _complete_successful_consensus(
+        self,
+        target,
+        my_hash,
+        all_votes,
+        total_expected,
+        majority_hash,
+        max_count,
+        live_peers,
+    ):
+        output_msg = ""
+
+        # 找出所有「實名制」回報但與多數派不一致的節點。
+        # 同時保留兩份：display（給使用者看）與 raw node_id（直接推送 TCP 用）。
+        tampered_display = []
+        tampered_node_ids = []
+        for nid, h in all_votes.items():
+            if h != majority_hash:
+                tag = "INVALID" if h == "INVALID" else ("EMPTY" if h == "EMPTY" else h[:12] + "...")
+                tampered_display.append(f"{nid}(Hash={tag})")
+                tampered_node_ids.append(nid)
+
+        # provider_id 只有在有節點需要修復時才會用到；
+        # 自己在多數派時直接把自己當 provider（符合「我發起的、我也對、就以我為準」）。
+        if my_hash == majority_hash:
+            provider_id = self.node_id
+        else:
+            provider_id = next(node_id for node_id, h in all_votes.items() if h == majority_hash)
+
+        if tampered_display:
+            detail = "、".join(tampered_display)
+            output_msg += f"\n異常節點: {detail}"
+            self.add_log(f"[共識] 異常節點: {detail}")
+
+            if my_hash == majority_hash:
+                # 【快速路徑】我自己就是 provider，手上就有正確資料。
+                # 直接平行 TCP 推送整本帳本給每個 tampered peer，避開兩段 UDP 掉包風險。
+                push_count = 0
+                for nid in tampered_node_ids:
+                    if nid in self.nodes_contact_book:
+                        target_addr = self.nodes_contact_book[nid]
+                        self.add_log(f"[共識] 直接推送帳本給 {nid}")
+                        threading.Thread(
+                            target=self._send_ledger_via_tcp,
+                            args=(target_addr,),
+                            daemon=True,
+                        ).start()
+                        push_count += 1
+                    else:
+                        self.add_log(f"[共識] 找不到 {nid} 的位址，跳過")
+                output_msg += f"\n已直接推送帳本給 {push_count} 個節點"
+            else:
+                # 【慢速路徑】我自己也壞了，沒有正確資料可推；
+                # 改走原本的廣播：通知所有 peer 去 provider 那邊要、自己也發 REQ_SYNC。
+                broadcast_msg = f"BROADCAST_MAJORITY:{majority_hash}:{provider_id}:{self.node_id}"
+                for peer in live_peers:
+                    self.sock.sendto(broadcast_msg.encode('utf-8'), peer)
+                self.add_log(f"[共識] 已廣播修復通知\n提供者: {provider_id}")
+
+                output_msg += f"\n本機與多數派不符\n正在向 {provider_id} 修復"
+                self.add_log(f"[同步] 本機帳本異常\n向 {provider_id} 請求修復")
+                if provider_id in self.nodes_contact_book:
+                    self.sock.sendto(b"REQ_SYNC", self.nodes_contact_book[provider_id])
+
+            # 等待 TCP 推送 / REQ_SYNC-RESP_SYNC 完成，再廣播獎勵交易，
+            # 否則 TX 會在還沒修好的節點上因本地帳本無效而被拒絕。
+            time.sleep(SYNC_WAIT_SECONDS)
+        else:
+            self.add_log("[共識] 全網一致\n無需修復")
+
+        if my_hash == majority_hash:
+            # 多數派一致 + 我也在多數派 → 解凍 + 廣播解凍給全網
+            self.network_trusted = True
+            self.network_trusted_reason = ""
+            self._broadcast_trust(live_peers)
+            output_msg += f"\n共識通過 ({max_count}/{total_expected})\n獎勵: 100 -> {target}"
+            prev_hash, after_hash = self._execute_transaction_with_receipt("SYSTEM", target, "100")
+            self._broadcast_transaction("SYSTEM", target, "100", prev_hash, after_hash)
+        else:
+            output_msg += f"\n本機已向 {provider_id} 修復\n本輪不發放獎勵"
+
+        return output_msg
+
+    def _try_finalize_rescue_consensus(self, target):
+        """救援後立刻複驗一次；若已形成過半，直接完成解凍流程。"""
+        my_hash, all_votes, total_expected = self._collect_last_hash_votes()
+        majority_hash, max_count = self._majority_hash(all_votes)
+
+        if total_expected < MIN_QUORUM_NODES:
+            return f"\n救援後複驗：存活節點不足 ({total_expected}/{MIN_QUORUM_NODES})，暫不解凍"
+
+        if not majority_hash:
+            return "\n救援後複驗：仍沒有有效帳本，暫不解凍"
+
+        if max_count <= total_expected / 2:
+            return f"\n救援後複驗：仍未達過半 ({max_count}/{total_expected})，暫不解凍"
+
+        live_peers = self._live_peer_addresses()
+        output_msg = f"\n救援後複驗：已形成過半 ({max_count}/{total_expected})"
+        output_msg += self._complete_successful_consensus(
+            target,
+            my_hash,
+            all_votes,
+            total_expected,
+            majority_hash,
+            max_count,
+            live_peers,
+        )
+        return output_msg
 
     def _repair_from_majority(self):
         my_hash, all_votes, total_expected = self._collect_last_hash_votes()
@@ -664,6 +829,17 @@ class P2PNode:
             msg = f"{msg} 自動修復: {repair_msg}"
             if repaired:
                 self.add_log(f"[AUTO_REPAIR] {msg}")
+                time.sleep(SYNC_WAIT_SECONDS)
+                with self.file_lock:
+                    repaired_valid, repaired_msg = self._check_chain_unlocked()
+                if repaired_valid:
+                    is_valid = True
+                    msg = (
+                        f"{msg}；修復後複檢: {repaired_msg}"
+                        "。若全網仍凍結，請發起全網共識驗證解凍。"
+                    )
+                else:
+                    msg = f"{msg}；修復後複檢仍失敗: {repaired_msg}"
 
         return (is_valid, msg) if gui_mode else is_valid
 
@@ -747,87 +923,15 @@ class P2PNode:
 
         # 5. 判斷是否過半數
         if max_count > total_expected / 2:
-
-            # 找出所有「實名制」回報但與多數派不一致的節點。
-            # 同時保留兩份：display（給使用者看）與 raw node_id（直接推送 TCP 用）。
-            tampered_display = []
-            tampered_node_ids = []
-            for nid, h in all_votes.items():
-                if h != majority_hash:
-                    tag = "INVALID" if h == "INVALID" else ("EMPTY" if h == "EMPTY" else h[:12] + "...")
-                    tampered_display.append(f"{nid}(Hash={tag})")
-                    tampered_node_ids.append(nid)
-
-            # provider_id 只有在有節點需要修復時才會用到；
-            # 自己在多數派時直接把自己當 provider（符合「我發起的、我也對、就以我為準」）。
-            if my_hash == majority_hash:
-                provider_id = self.node_id
-            else:
-                provider_id = next(node_id for node_id, h in all_votes.items() if h == majority_hash)
-
-            if tampered_display:
-                detail = "、".join(tampered_display)
-                output_msg += f"\n異常節點: {detail}"
-                self.add_log(f"[共識] 異常節點: {detail}")
-
-                if my_hash == majority_hash:
-                    # ========================================================
-                    # 【快速路徑】我自己就是 provider，手上就有正確資料。
-                    # 跳過 BROADCAST_MAJORITY (UDP) → REQ_SYNC (UDP) 這條兩段 UDP 的迂迴，
-                    # 直接平行 TCP 推送整本帳本給每個 tampered peer。
-                    # 跨機環境下省掉 2 段可能掉包的 UDP，整輪從 4~5 秒縮短到 1~2 秒，
-                    # 且 TCP 本身有重傳，可靠性遠高於 UDP。
-                    # 若推送失敗，下一輪 _auto_consensus_loop 仍會接手，安全。
-                    # ========================================================
-                    push_count = 0
-                    for nid in tampered_node_ids:
-                        if nid in self.nodes_contact_book:
-                            target_addr = self.nodes_contact_book[nid]
-                            self.add_log(f"[共識] 直接推送帳本給 {nid}")
-                            threading.Thread(
-                                target=self._send_ledger_via_tcp,
-                                args=(target_addr,),
-                                daemon=True,
-                            ).start()
-                            push_count += 1
-                        else:
-                            self.add_log(f"[共識] 找不到 {nid} 的位址，跳過")
-                    output_msg += f"\n已直接推送帳本給 {push_count} 個節點"
-                else:
-                    # ========================================================
-                    # 【慢速路徑】我自己也壞了，沒有正確資料可推；
-                    # 改走原本的廣播：通知所有 peer 去 provider 那邊要、自己也發 REQ_SYNC。
-                    # ========================================================
-                    broadcast_msg = f"BROADCAST_MAJORITY:{majority_hash}:{provider_id}:{self.node_id}"
-                    for peer in live_peers:
-                        self.sock.sendto(broadcast_msg.encode('utf-8'), peer)
-                    self.add_log(f"[共識] 已廣播修復通知\n提供者: {provider_id}")
-
-                    output_msg += f"\n本機與多數派不符\n正在向 {provider_id} 修復"
-                    self.add_log(f"[同步] 本機帳本異常\n向 {provider_id} 請求修復")
-                    if provider_id in self.nodes_contact_book:
-                        self.sock.sendto(b"REQ_SYNC", self.nodes_contact_book[provider_id])
-
-                # 等待 TCP 推送 / REQ_SYNC-RESP_SYNC 完成，再廣播獎勵交易，
-                # 否則 TX 會在還沒修好的節點上因本地帳本無效而被拒絕。
-                time.sleep(SYNC_WAIT_SECONDS)
-            else:
-                # ===== 全網一致 → 沒有人需要修復，不送 BROADCAST_MAJORITY、也不必 sleep =====
-                self.add_log("[共識] 全網一致\n無需修復")
-
-            if my_hash == majority_hash:
-                # 多數派一致 + 我也在多數派 → 解凍 + 廣播解凍給全網
-                self.network_trusted = True
-                self.network_trusted_reason = ""
-                self._broadcast_trust(live_peers)
-                output_msg += f"\n共識通過 ({max_count}/{total_expected})\n獎勵: 100 -> {target}"
-                self._execute_transaction("SYSTEM", target, "100")
-                # 廣播交易給所有人
-                for peer in self.peers:
-                    self.sock.sendto(f"TX:SYSTEM:{target}:100".encode('utf-8'), peer)
-            else:
-                # 走到這裡保證 tampered 非空（我自己就在 tampered 裡），provider_id 一定有定義
-                output_msg += f"\n本機已向 {provider_id} 修復\n本輪不發放獎勵"
+            output_msg += self._complete_successful_consensus(
+                target,
+                my_hash,
+                all_votes,
+                total_expected,
+                majority_hash,
+                max_count,
+                live_peers,
+            )
         else:
             # =================================================================
             # 未達過半 —— 救援邏輯
@@ -891,10 +995,8 @@ class P2PNode:
             if rescue_attempted:
                 # 留一段時間等 TCP 推送 / REQ_SYNC-RESP_SYNC 完成
                 time.sleep(SYNC_WAIT_SECONDS)
-                output_msg += "\n救援已派出，請再次發起全網驗證以解凍"
-                # 注意：這裡不發 TRUST（網路還沒過半，不能保證一致），
-                #       也不發 DISTRUST（救援還在發酵，下輪可能就過半）。
-                #       network_trusted 維持原狀。
+                output_msg += "\n救援已派出，正在複驗是否可解凍"
+                output_msg += self._try_finalize_rescue_consensus(target)
             else:
                 # 真的沒救：純分裂（沒有 INVALID 節點可救）或全網皆無 valid hash
                 self.network_trusted = False
@@ -903,6 +1005,109 @@ class P2PNode:
                 self._broadcast_distrust(reason, live_peers)
 
         if gui_mode: return output_msg
+
+    def _execute_transaction_with_receipt(self, sender, receiver, amount):
+        prev_hash = self._get_last_block_hash()
+        self._execute_transaction(sender, receiver, amount)
+        after_hash = self._get_last_block_hash()
+        return prev_hash, after_hash
+
+    def _broadcast_transaction(self, sender, receiver, amount, prev_hash, after_hash):
+        msg = (
+            f"TX2:{sender}:{receiver}:{amount}:"
+            f"{prev_hash}:{after_hash}:{self.node_id}:{self.network_token}"
+        )
+        payload = msg.encode('utf-8')
+        for peer in self.peers:
+            try:
+                self.sock.sendto(payload, peer)
+            except Exception as e:
+                self.add_log(f"[同步] TX2 發送至 {peer} 失敗，等待 TCP 補救: {e}")
+
+        # UDP 是快路徑；debounced TCP ledger snapshot 是保險。
+        # 這會補上「最後一筆 TX2 剛好掉包」且後面沒有下一筆可觸發缺口偵測的情況。
+        self._schedule_ledger_repair_fanout("交易廣播補救")
+
+    def _handle_reliable_tx(self, parts):
+        if len(parts) != 8:
+            self.add_log("[同步] 收到格式錯誤的 TX2，已忽略")
+            return False
+
+        _, sender, receiver, amount, prev_hash, after_hash, initiator_id, token = parts
+        if token != self.network_token:
+            self.add_log("[同步] 收到 token 不符的 TX2，已忽略")
+            return False
+
+        my_hash = self._get_last_block_hash()
+        if my_hash == after_hash:
+            self.add_log(f"[同步] TX2 已套用，忽略重送\n{sender} -> {receiver} ({amount})")
+            return True
+
+        if my_hash != prev_hash:
+            self._request_sync_from_node(
+                initiator_id,
+                f"偵測到交易序列缺口（本地 {my_hash[:12]}...，預期 {prev_hash[:12]}...）",
+            )
+            return True
+
+        try:
+            self._execute_transaction(sender, receiver, amount)
+            new_hash = self._get_last_block_hash()
+            if new_hash != after_hash:
+                self._request_sync_from_node(
+                    initiator_id,
+                    f"交易套用後 hash 不一致（本地 {new_hash[:12]}...，預期 {after_hash[:12]}...）",
+                )
+            else:
+                self.add_log(f"[同步] 收到可靠交易\n{sender} -> {receiver} ({amount})")
+        except ValueError as e:
+            self.add_log(
+                f"[同步] TX2 套用失敗 {sender}->{receiver}({amount})\n原因: {e}"
+            )
+            self._request_sync_from_node(initiator_id, "可靠交易套用失敗")
+        return True
+
+    def _execute_client_transaction(self, sender, receiver, amount, tx_id=None):
+        if not tx_id:
+            prev_hash, after_hash = self._execute_transaction_with_receipt(sender, receiver, amount)
+            self._broadcast_transaction(sender, receiver, amount, prev_hash, after_hash)
+            return {"prev_hash": prev_hash, "after_hash": after_hash}
+
+        owner = False
+        while True:
+            with self.tx_id_lock:
+                cached = self.tx_id_results.get(tx_id)
+                if cached is not None:
+                    ok, payload = cached
+                    if ok:
+                        return payload
+                    raise ValueError(payload["message"])
+
+                event = self.tx_id_inflight.get(tx_id)
+                if event is None:
+                    event = threading.Event()
+                    self.tx_id_inflight[tx_id] = event
+                    owner = True
+                    break
+
+            event.wait(timeout=15)
+
+        try:
+            prev_hash, after_hash = self._execute_transaction_with_receipt(sender, receiver, amount)
+            result = {"tx_id": tx_id, "prev_hash": prev_hash, "after_hash": after_hash}
+            self._broadcast_transaction(sender, receiver, amount, prev_hash, after_hash)
+            with self.tx_id_lock:
+                self.tx_id_results[tx_id] = (True, result)
+            return result
+        except ValueError:
+            # 失敗的交易不快取，避免暫時性凍結/修復中的錯誤把同一 tx_id 永久釘死。
+            raise
+        finally:
+            if owner:
+                with self.tx_id_lock:
+                    event = self.tx_id_inflight.pop(tx_id, None)
+                    if event:
+                        event.set()
 
     def _execute_transaction(self, sender, receiver, amount):
         # 0. SYSTEM 交易（共識成功後的獎勵）不受信任凍結影響；其餘必須通過信任檢查

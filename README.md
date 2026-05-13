@@ -63,7 +63,7 @@ The demo runs **6 P2P nodes** spread across two hosts, connected through a
 | --- | --- |
 | Custom chained ledger | Each `/storage/<n>.txt` is a block (max 5 transactions), linked by SHA-256 |
 | Three-layer integrity check | Block-ID contiguity (1..N) + genesis `prev_hash == 0` + per-block hash chain + `latest_hash.txt` head check |
-| UDP P2P broadcast | Heartbeat, transactions, hash votes, repair requests, and trust signals all run over UDP — no broker |
+| Reliable UDP transaction broadcast | `TX2` carries before/after ledger hashes; missed or out-of-order packets trigger `REQ_SYNC` repair |
 | Heartbeat-driven liveness | `PING` every 2 s, peer goes offline after 5 s of silence; status visible in the GUI |
 | Dynamic majority consensus | Threshold computed from **live** peers, not a fixed list — works with any subset ≥ 2 nodes |
 | Hard quorum floor | Consensus refuses to run with fewer than 2 live nodes (prevents single-node "self-trust") |
@@ -71,6 +71,7 @@ The demo runs **6 P2P nodes** spread across two hosts, connected through a
 | Network-wide trust state | Consensus failure broadcasts `BROADCAST_DISTRUST` so **every** node freezes; success broadcasts `BROADCAST_TRUST` to unfreeze |
 | Frozen-node guard | Balance / log / transaction operations refuse to run while frozen, with a clear reason |
 | Automatic ledger repair | On hash mismatch, a node sends `REQ_SYNC`, gets the full ledger back, overwrites locally, then reports `REPAIR_DONE` |
+| Debounced TCP ledger snapshot | After a burst of transactions, the initiator pushes a final ledger snapshot to live peers to cover the last lost UDP packet |
 | Live status panel | Web GUI shows online/offline dots for all 6 nodes, plus a "trusted / frozen" badge |
 | One-click demo | `demo.bat` (Windows) and `start_demo.sh` (Linux/macOS) bring everything up and inject 100 random transactions |
 
@@ -192,15 +193,17 @@ A typical live-demo storyline:
    - Client 2 reports `REPAIR_DONE` → initiator logs **"節點 ... 修復完成"**.
    - Initiator's hash matches the majority → 100-coin SYSTEM reward, then
      `BROADCAST_TRUST` keeps the network's trust badge green.
-5. **Force a no-majority scenario** by tampering Client 1 and Client 2 with
-   different content, then run consensus from Client 3:
-   - Result: `未達過半 (1/3)` — `BROADCAST_DISTRUST` fires.
-   - Every node's badge turns **frozen**.
-   - Try Balance / Log / Transaction on any node: all rejected with the reason
-     `來自 ... 的全網共識失敗通知（無法達成過半數共識 ...）`.
-6. **Recover** by restoring the tampered ledgers (manually copy a healthy
-   storage, or wait for a node that does match the truth) and rerun consensus.
-   Once a majority forms, `BROADCAST_TRUST` unfreezes the entire network in one round.
+5. **Force a 3-good / 3-broken scenario** in a 6-node run by corrupting three
+   ledgers without updating their hash chain, then run consensus:
+   - The first tally is `未達過半 (3/6)`.
+   - Because the bad peers are `INVALID` / `EMPTY`, healthy nodes push a rescue
+     ledger (or a broken initiator pulls from the largest valid group).
+   - The initiator immediately re-checks hashes; once the rescue creates 4/6 or
+     better, `BROADCAST_TRUST` unfreezes the network in the same run.
+6. **Force a true split-brain scenario** by creating two internally valid ledger
+   histories with equal votes. With no clearly broken peer to rescue, consensus
+   freezes via `BROADCAST_DISTRUST` until an operator restores or removes the
+   ambiguous fork.
 
 ---
 
@@ -212,7 +215,7 @@ A typical live-demo storyline:
 | GET | `/api/peers` | Live status for all 6 nodes + `network_trusted` / `network_trusted_reason` |
 | GET | `/api/money/<account>` | Balance (`null` if local ledger invalid or network frozen) |
 | GET | `/api/log/<account>` | Transactions involving the account (empty array if frozen) |
-| POST | `/api/transaction` | Body: `{"sender","receiver","amount"}`; returns 400 with reason if frozen |
+| POST | `/api/transaction` | Body: `{"sender","receiver","amount","tx_id?"}`; optional `tx_id` makes timeout retries idempotent |
 | GET | `/api/checkChain` | Validates the local chain; auto-repairs from the majority on mismatch |
 | GET | `/api/checkAllChains/<target>` | Runs network-wide consensus; rewards `<target>` with 100 on success |
 | GET | `/api/poll_logs` | Drains and returns the node log buffer |
@@ -257,7 +260,8 @@ Every authenticated message carries `network_token = "MY_BLOCKCHAIN_SECRET_2026"
 
 | Message | Direction | Purpose |
 | --- | --- | --- |
-| `TX:<sender>:<receiver>:<amount>` | broadcast | Replicate a transaction; receivers append it to their local ledger |
+| `TX2:<sender>:<receiver>:<amount>:<prev_hash>:<after_hash>:<initiator_id>:<token>` | broadcast | Reliable transaction replication. Receiver appends only when its current hash matches `prev_hash`; otherwise it requests `REQ_SYNC` from the initiator |
+| `TX:<sender>:<receiver>:<amount>` | broadcast | Legacy transaction format kept for compatibility |
 | `REQ_HASH` | 1 → N (live peers only) | Ask peers to report the SHA-256 of their latest block |
 | `RESP_HASH:<hash>:<node_id>:<token>` | N → 1 | Hash reply; packets with a wrong `token` are dropped |
 | `REQ_SYNC` | point-to-point | Damaged node asks the provider for the full ledger |
@@ -386,7 +390,8 @@ Each node holds `self.network_trusted` (default `True`). The state changes
 | All votes `INVALID` / `EMPTY` | `False`, reason: `全網均無效帳本` | `BROADCAST_DISTRUST` |
 | Majority found, my hash matches | `True`, reason cleared | `BROADCAST_TRUST` |
 | Majority found, my hash differs (I'm being repaired) | unchanged this round; next consensus run promotes to `True` | `BROADCAST_MAJORITY` (repair) |
-| No majority (e.g. 1/3) | `False`, reason: `無法達成過半數共識 (X/Y)` | `BROADCAST_DISTRUST` |
+| No majority, but some peers are `INVALID` / `EMPTY` | unchanged while rescue runs; flips to `True` if the rescue follow-up reaches majority | TCP/`REQ_SYNC` repair, then `BROADCAST_TRUST` if follow-up passes |
+| No majority and no clearly broken peer to rescue | `False`, reason: `無法達成過半數共識 (X/Y)` | `BROADCAST_DISTRUST` |
 
 Receivers handle the broadcasts unconditionally:
 
@@ -426,10 +431,15 @@ check, so the post-consensus 100-coin reward still goes out.
 8. **Report back** — the repaired node sends `REPAIR_DONE` to the initiator,
    which logs `節點 ... 修復完成`.
 9. **Reward & trust** — if the initiator's own hash matches the majority, it
-   credits 100 coins to `<target>`, broadcasts the matching `TX:` message, and
+   credits 100 coins to `<target>`, broadcasts the matching `TX2:` message, and
    sends `BROADCAST_TRUST` to clear any frozen state on peers.
-10. **Failure path** — if no majority, the initiator freezes itself and
-    broadcasts `BROADCAST_DISTRUST`, freezing every live peer too.
+10. **Rescue path** — if no majority but one side is clearly `INVALID` /
+    `EMPTY`, healthy peers push the ledger or the broken initiator pulls from
+    the largest valid group. The initiator immediately re-votes; if the repair
+    creates a majority, it broadcasts `BROADCAST_TRUST` in the same run.
+11. **Failure path** — if no majority and no clearly broken peer can be rescued,
+    the initiator freezes itself and broadcasts `BROADCAST_DISTRUST`, freezing
+    every live peer too.
 
 Defensive design choices:
 
@@ -463,10 +473,13 @@ populated. Until that arrives, every peer is treated as offline. Once the first
 should see a stable green within 4-5 seconds of startup.
 
 **Q4. The badge went red after a tampering test — how do I clear it?**
-Restore the tampered ledger(s) and re-run **Network-wide Consensus** on a
-healthy node. As soon as a majority is reached, `BROADCAST_TRUST` flips every
-peer back to green in one round. Until that happens, balance / log / transaction
-operations are blocked on every node.
+If the tampered ledgers fail local integrity checks (`INVALID` / `EMPTY`), run
+**Network-wide Consensus** again. The rescue path repairs the broken nodes and
+immediately performs a follow-up vote; once a majority forms,
+`BROADCAST_TRUST` flips every peer back to green. If the red badge came from an
+equal split between two internally valid histories, restore the intended ledger
+or take one fork offline first, because the system cannot safely choose between
+two valid 3/3 histories by itself.
 
 **Q5. Can I run with only 3 nodes (one host)?**
 Yes — that's the default configuration. With three nodes online the live

@@ -78,15 +78,14 @@ def api_check_log(account):
 def api_transaction():
     try:
         data = request.json
-        # 呼叫執行交易
-        node_instance._execute_transaction(data['sender'], data['receiver'], data['amount'])
-        
-        # 成功才廣播
-        tx_msg = f"TX:{data['sender']}:{data['receiver']}:{data['amount']}"
-        for peer in node_instance.peers:
-            node_instance.sock.sendto(tx_msg.encode('utf-8'), peer)
-            
-        return jsonify({"status": "success", "message": "交易成功"}), 200
+        result = node_instance._execute_client_transaction(
+            data['sender'],
+            data['receiver'],
+            data['amount'],
+            data.get('tx_id'),
+        )
+
+        return jsonify({"status": "success", "message": "交易成功", **result}), 200
         
     except ValueError as e:
         # 捕捉餘額不足的錯誤
